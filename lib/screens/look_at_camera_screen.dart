@@ -1,0 +1,815 @@
+﻿import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+import '../models/enrollment_draft.dart';
+import '../services/biometric_enrollment_api.dart';
+import '../theme/app_theme.dart';
+import '../widgets/app_background.dart';
+import '../widgets/primary_button.dart';
+import '../widgets/tick_ring.dart';
+import 'enrollment_key_result_screen.dart';
+
+class LookAtCameraScreen extends StatefulWidget {
+  const LookAtCameraScreen({
+    super.key,
+    required this.draft,
+  });
+
+  static const route = '/look';
+  final EnrollmentDraft draft;
+
+  @override
+  State<LookAtCameraScreen> createState() => _LookAtCameraScreenState();
+}
+
+class _LookAtCameraScreenState extends State<LookAtCameraScreen>
+    with WidgetsBindingObserver {
+  static const _analysisThrottle = Duration(milliseconds: 200);
+
+  // Fixed 3:4 aspect ratio
+  static const double _targetPreviewAspect = 3.0 / 4.0;
+
+  // Face-detection thresholds (3:4 only)
+  static const double _minNormW = 0.15;
+  static const double _maxNormW = 0.40;
+  static const double _minNormH = 0.22;
+  static const double _maxNormH = 0.50;
+  static const double _minArea  = 0.05;
+  static const double _maxArea  = 0.22;
+
+  // Consecutive good frames required before triggering capture
+  static const int _requiredGoodFrames = 3;
+  int _consecutiveGoodFrames = 0;
+
+  // Camera / detector state
+  CameraController? _controller;
+  Future<void>? _initializeFuture;
+
+  final FaceDetector _faceDetector = FaceDetector(
+    options: FaceDetectorOptions(
+      performanceMode: FaceDetectorMode.fast,
+      enableContours: false,
+      enableLandmarks: false,
+    ),
+  );
+
+  final BiometricEnrollmentApi _api = BiometricEnrollmentApi();
+
+  bool _isAnalyzing = false;
+  bool _isStreaming = false;
+  bool _isBusy = false;
+  bool _isUploading = false;
+  bool _didTriggerCapture = false;
+  DateTime? _lastAnalysisAt;
+  double _lastFrameW = 0;
+  double _lastFrameH = 0;
+  double _uploadProgress = 0.0;
+  String _status = 'Center your face inside the ring.';
+  String? _cameraError;
+  String? _uploadErrorDetail;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _api.loadEndpoint().then((_) {
+      if (mounted) setState(() {});
+    });
+    _initializeCamera();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _faceDetector.close();
+    _controller?.dispose();
+    _controller = null;
+    _initializeFuture = null;
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
+
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      controller.dispose();
+      _controller = null;
+      _initializeFuture = null;
+      _isStreaming = false;
+      _isBusy = false;
+      if (mounted) setState(() {});
+      return;
+    }
+    if (state == AppLifecycleState.resumed) {
+      _initializeCamera();
+    }
+  }
+
+  // ─── Camera init ─────
+
+  Future<void> _initializeCamera() async {
+    setState(() {
+      _cameraError = null;
+      _status = 'Center your face inside the ring.';
+    });
+
+    final permission = await Permission.camera.request();
+    if (!permission.isGranted) {
+      setState(() {
+        _cameraError = 'Camera permission is required.';
+        _status = 'Camera permission is required.';
+      });
+      return;
+    }
+
+    try {
+      final cameras = await availableCameras();
+      final frontCameras = cameras
+          .where((c) => c.lensDirection == CameraLensDirection.front)
+          .toList();
+
+      CameraDescription front;
+
+      if (frontCameras.isEmpty) {
+        front = cameras.first;
+      } else if (frontCameras.length == 1) {
+        front = frontCameras.first;
+      } else {
+        
+        front = frontCameras.first;
+
+        double bestScore = 0;
+
+        for (final cam in frontCameras) {
+          final test = CameraController(cam, ResolutionPreset.medium, enableAudio: false);
+          await test.initialize();
+
+          final size = test.value.previewSize;
+          await test.dispose();
+
+          if (size != null) {
+            final area = size.width * size.height;
+
+            if (area > bestScore) {
+              bestScore = area;
+              front = cam;
+            }
+          }
+        }
+      }
+
+      // Try presets to find one closest to 3:4
+      ResolutionPreset selectedPreset = ResolutionPreset.max;
+      final presetsToTry = [
+        ResolutionPreset.max,
+        ResolutionPreset.ultraHigh,
+        ResolutionPreset.veryHigh,
+        ResolutionPreset.high,
+        ResolutionPreset.medium,
+      ];
+
+      for (final preset in presetsToTry) {
+        final test = CameraController(front, preset, enableAudio: false);
+        await test.initialize();
+        final size = test.value.previewSize;
+        await test.dispose();
+        if (size != null && ((size.width / size.height) - 0.75).abs() < 0.05) {
+          selectedPreset = preset;
+          debugPrint('Found 3:4 preset: $preset (${size.width}x${size.height})');
+          break;
+        }
+      }
+
+      final controller = CameraController(
+        front,
+        selectedPreset,
+        enableAudio: false,
+        imageFormatGroup: Platform.isIOS
+            ? ImageFormatGroup.bgra8888
+            : ImageFormatGroup.yuv420,
+      );
+
+      _controller = controller;
+      _initializeFuture = controller.initialize();
+      setState(() {});
+
+      await _initializeFuture;
+      //await controller.setZoomLevel(0.75);
+      final minZoom = await controller.getMinZoomLevel();
+      await controller.setZoomLevel(minZoom);
+
+      if (controller.value.isInitialized) {
+        final size = controller.value.previewSize;
+        if (size != null) {
+          debugPrint('Camera: ${size.width}x${size.height}  ratio: ${size.width / size.height}');
+        }
+      }
+
+      if (!mounted) return;
+      await _startFaceTracking();
+      setState(() {});
+    } on CameraException catch (e) {
+      setState(() {
+        _cameraError = e.description ?? e.code;
+        _status = 'Unable to initialize the camera.';
+      });
+    } catch (e) {
+      setState(() {
+        _cameraError = e.toString();
+        _status = 'Unable to initialize the camera.';
+      });
+    }
+  }
+
+  // ─── Face tracking ──────
+
+  Future<void> _startFaceTracking() async {
+    final controller = _controller;
+    if (controller == null ||
+        !controller.value.isInitialized ||
+        controller.value.isStreamingImages ||
+        _isBusy) {
+      return;
+    }
+
+    _isStreaming = true;
+    _didTriggerCapture = false;
+    _consecutiveGoodFrames = 0;
+    _setStatus('Center your face inside the ring.');
+
+    await controller.startImageStream((image) async {
+      if (_isAnalyzing || _isBusy || _isUploading || _didTriggerCapture) return;
+
+      final now = DateTime.now();
+      final last = _lastAnalysisAt;
+      if (last != null && now.difference(last) < _analysisThrottle) return;
+      _lastAnalysisAt = now;
+
+      _isAnalyzing = true;
+      try {
+        final inputImage = _buildInputImage(controller, image);
+        if (inputImage == null) return;
+        final faces = await _faceDetector.processImage(inputImage);
+        _handleFaces(faces, image.width.toDouble(), image.height.toDouble());
+      } catch (e, st) {
+        debugPrint('[FaceDetect] $e\n$st');
+      } finally {
+        _isAnalyzing = false;
+      }
+    });
+  }
+
+  InputImage? _buildInputImage(CameraController controller, CameraImage image) {
+    final rotation = _inputRotationFromSensor(
+      controller.description.sensorOrientation,
+      controller.description.lensDirection,
+    );
+
+    if (Platform.isIOS) {
+      final format = InputImageFormatValue.fromRawValue(image.format.raw);
+      if (format == null) {
+        debugPrint('[FaceDetect] iOS: unknown format raw=${image.format.raw}');
+        return null;
+      }
+      final plane = image.planes.first;
+      return InputImage.fromBytes(
+        bytes: plane.bytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: format,
+          bytesPerRow: plane.bytesPerRow,
+        ),
+      );
+    }
+
+    if (image.planes.length < 3) {
+      debugPrint('[FaceDetect] Expected 3 planes, got ${image.planes.length}');
+      return null;
+    }
+
+    final int width  = image.width;
+    final int height = image.height;
+
+    final Uint8List yPlane      = image.planes[0].bytes;
+    final Uint8List uPlane      = image.planes[1].bytes;
+    final Uint8List vPlane      = image.planes[2].bytes;
+    final int      yRowStride   = image.planes[0].bytesPerRow;
+    final int      uvRowStride  = image.planes[1].bytesPerRow;
+    final int      uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
+
+    final nv21 = Uint8List(width * height + (width * height ~/ 2));
+    int idx = 0;
+
+    for (int row = 0; row < height; row++) {
+      nv21.setRange(idx, idx + width, yPlane, row * yRowStride);
+      idx += width;
+    }
+    for (int row = 0; row < height ~/ 2; row++) {
+      for (int col = 0; col < width ~/ 2; col++) {
+        final int uvOffset = row * uvRowStride + col * uvPixelStride;
+        nv21[idx++] = vPlane[uvOffset];
+        nv21[idx++] = uPlane[uvOffset];
+      }
+    }
+
+    return InputImage.fromBytes(
+      bytes: nv21,
+      metadata: InputImageMetadata(
+        size: Size(width.toDouble(), height.toDouble()),
+        rotation: rotation,
+        format: InputImageFormat.nv21,
+        bytesPerRow: width,
+      ),
+    );
+  }
+
+  /// Correct rotation for both front and rear cameras on Android and iOS.
+  InputImageRotation _inputRotationFromSensor(
+      int sensorOrientation, CameraLensDirection lensDirection) {
+    final isFront = lensDirection == CameraLensDirection.front;
+
+    if (Platform.isAndroid && isFront) {
+      // Front camera on Android: invert rotation to compensate for mirroring
+      switch (sensorOrientation) {
+        case 90:  return InputImageRotation.rotation270deg;
+        case 270: return InputImageRotation.rotation90deg;
+        case 180: return InputImageRotation.rotation180deg;
+        default:  return InputImageRotation.rotation0deg;
+      }
+    }
+
+    // Rear camera (Android) or any iOS camera
+    switch (sensorOrientation) {
+      case 90:  return InputImageRotation.rotation90deg;
+      case 180: return InputImageRotation.rotation180deg;
+      case 270: return InputImageRotation.rotation270deg;
+      default:  return InputImageRotation.rotation0deg;
+    }
+  }
+
+  void _handleFaces(List<Face> faces, double imageWidth, double imageHeight) {
+    if (faces.isEmpty) {
+      _consecutiveGoodFrames = 0;
+      return;
+    }
+
+    final face = faces.reduce((best, c) =>
+        c.boundingBox.width * c.boundingBox.height >
+                best.boundingBox.width * best.boundingBox.height
+            ? c
+            : best);
+
+    _lastFrameW = imageWidth;
+    _lastFrameH = imageHeight;
+
+    if (_isFaceInsideGuide(face.boundingBox, imageWidth, imageHeight)) {
+      _consecutiveGoodFrames++;
+      if (_consecutiveGoodFrames >= _requiredGoodFrames) {
+        _didTriggerCapture = true;
+        unawaited(_captureAndUpload());
+      }
+    } else {
+      _consecutiveGoodFrames = 0;
+    }
+  }
+
+  ({double left, double top, double right, double bottom}) _toDisplayRect(
+      Rect box, double imageWidth, double imageHeight) {
+    if (imageWidth > imageHeight) {
+      return (
+        left:   1.0 - (box.bottom / imageHeight),
+        top:    box.left  / imageWidth,
+        right:  1.0 - (box.top    / imageHeight),
+        bottom: box.right / imageWidth,
+      );
+    } else {
+      return (
+        left:   1.0 - (box.right  / imageWidth),
+        top:    box.top    / imageHeight,
+        right:  1.0 - (box.left   / imageWidth),
+        bottom: box.bottom / imageHeight,
+      );
+    }
+  }
+
+  bool _isFaceInsideGuide(Rect box, double imageWidth, double imageHeight) {
+    final r = _toDisplayRect(box, imageWidth, imageHeight);
+
+    final normW   = r.right  - r.left;
+    final normH   = r.bottom - r.top;
+    final centerX = r.left + normW / 2;
+    final centerY = r.top  + normH / 2;
+    final area    = normW * normH;
+
+    const targetCenterY    = 0.38;
+    const margin           = 0.03;
+
+    final isFullyContained = r.left  >= margin &&
+                             r.right  <= (1.0 - margin) &&
+                             r.top    >= margin &&
+                             r.bottom <= (1.0 - margin);
+
+    final isWellCentered      = (centerX - 0.5).abs()        <= 0.12 &&
+                                (centerY - targetCenterY).abs() <= 0.10;
+    final isWidthAppropriate  = normW >= _minNormW && normW <= _maxNormW;
+    final isHeightAppropriate = normH >= _minNormH && normH <= _maxNormH;
+    final isAreaAppropriate   = area  >= _minArea  && area  <= _maxArea;
+
+    return isFullyContained &&
+           isWellCentered &&
+           isWidthAppropriate &&
+           isHeightAppropriate &&
+           isAreaAppropriate;
+  }
+
+  void _setStatus(String next) {
+    if (!mounted || _status == next) return;
+    setState(() => _status = next);
+  }
+
+  // ─── Capture & upload (single frame — no video) ───
+
+  Future<void> _captureAndUpload() async {
+    final controller = _controller;
+    if (controller == null || _isBusy || _isUploading) return;
+    if (mounted) setState(() => _uploadErrorDetail = null);
+
+    try {
+      // Stop the image stream before taking a picture
+      if (controller.value.isStreamingImages) {
+        await controller.stopImageStream();
+      }
+      _isStreaming = false;
+      _isBusy = true;
+      _setStatus('Capturing…');
+      if (mounted) setState(() => _uploadProgress = 0.0);
+
+      // Take a single still frame
+      final xfile = await controller.takePicture();
+
+      _isUploading = true;
+      _setStatus('Uploading…');
+      if (mounted) setState(() => _uploadProgress = 0.5);
+
+      final result = await _api.uploadEnrollment(
+        draft: widget.draft,
+        videoFile: File(xfile.path),   // API accepts a File; pass the JPEG
+        frameWidth: _lastFrameW,
+        frameHeight: _lastFrameH,
+      );
+
+      // Clean up the temp image
+      try { await File(xfile.path).delete(); } catch (_) {}
+
+      if (!mounted) return;
+
+      _isUploading = false;
+      _isBusy = false;
+
+      if (result.ok) {
+        setState(() => _uploadProgress = 1.0);
+        _setStatus(result.message);
+        await Navigator.of(context).pushAndRemoveUntil<void>(
+          MaterialPageRoute<void>(
+            builder: (_) => EnrollmentKeyResultScreen(
+              username: widget.draft.username,
+              hashkey: result.hashkey,
+            ),
+          ),
+          (route) => route.isFirst,
+        );
+        return;
+      }
+
+      // Upload failed
+      setState(() {
+        _uploadProgress = 0.0;
+        if (result.statusCode != 409) {
+          _uploadErrorDetail = result.message;
+        }
+      });
+      _setStatus(result.message);
+      _didTriggerCapture = false;
+      await _restartTrackingIfNeeded();
+    } catch (e) {
+      _didTriggerCapture = false;
+      _isBusy = false;
+      _isUploading = false;
+      if (!mounted) return;
+      final url = _api.endpointSync.isEmpty ? '(no URL)' : _api.endpointSync;
+      setState(() {
+        _uploadErrorDetail = 'Enrollment failed.\nPOST $url\n\n$e';
+        _uploadProgress = 0.0;
+      });
+      _setStatus('Could not complete enrollment. Try again.');
+      await _restartTrackingIfNeeded();
+    }
+  }
+
+  Future<void> _restartTrackingIfNeeded() async {
+    if (!mounted) return;
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized || _isUploading) return;
+    if (!_isBusy && !_isStreaming) {
+      _consecutiveGoodFrames = 0;
+      await _startFaceTracking();
+      if (mounted) setState(() {});
+    }
+  }
+
+  // ─── Build ──────
+
+  @override
+  Widget build(BuildContext context) {
+    final size = MediaQuery.sizeOf(context);
+
+    //Circle size
+    final double ringSize = (size.width * 0.75).clamp(240.0, 340.0);
+    final double ringCentreFromTop = size.height * 0.38;
+    final double ringLeft         = (size.width - ringSize) / 2;
+    final double ringTop          = ringCentreFromTop - ringSize / 2;
+    const double tickRingMargin   = 20;
+
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      extendBodyBehindAppBar: true,
+      extendBody: true,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          // 1. Full-screen camera feed
+          _FullScreenCamera(
+            controller: _controller,
+            initializeFuture: _initializeFuture,
+            error: _cameraError,
+            onRetry: _initializeCamera,
+          ),
+
+          // 2. Close button
+          SafeArea(
+            child: Align(
+              alignment: Alignment.topLeft,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: GestureDetector(
+                  onTap: () => Navigator.of(context).popUntil((r) => r.isFirst),
+                  child: Container(
+                    width: 36,
+                    height: 36,
+                    decoration: const BoxDecoration(
+                      color: Colors.black54,
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(Icons.close, color: Colors.white, size: 20),
+                  ),
+                ),
+              ),
+            ),
+          ),
+
+          // 3. Tick-ring overlay
+          Positioned(
+            left:   ringLeft - tickRingMargin,
+            top:    ringTop  - tickRingMargin,
+            width:  ringSize + (tickRingMargin * 2),
+            height: ringSize + (tickRingMargin * 2),
+            child: TickRing(
+              size:              ringSize + (tickRingMargin * 2),
+              tickCount:         72,
+              tickWidth:         4,
+              tickLength:        14,
+              gap:               0,
+              tickColor:         const Color(0xFFBFC6CF),
+              activeTickColor:   const Color(0xFF00E676),
+              activeTickFraction: _uploadProgress,
+              child: const SizedBox.shrink(),
+            ),
+          ),
+
+          // 4. Bottom panel
+          Align(
+            alignment: Alignment.bottomCenter,
+            child: Container(
+              width: double.infinity,
+              color: Colors.black,
+              padding: const EdgeInsets.fromLTRB(24, 28, 24, 32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Look at the camera',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _status,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 14,
+                      height: 1.4,
+                      color: Color(0xFFBFC6CF),
+                    ),
+                  ),
+
+                  if (_uploadErrorDetail != null && !_isUploading) ...[
+                    const SizedBox(height: 10),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF2A1518),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: const Color(0xFF5C2A32)),
+                      ),
+                      child: Text(
+                        _uploadErrorDetail!,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          height: 1.45,
+                          color: Color(0xFFE8D4D4),
+                        ),
+                      ),
+                    ),
+                  ],
+
+                  const SizedBox(height: 20),
+
+                  PrimaryButton(
+                    label: _isBusy || _isUploading ? 'Please wait…' : 'Start over',
+                    backgroundColor: (!_isBusy && !_isUploading)
+                        ? AppTheme.accent
+                        : const Color(0xFF2A313C),
+                    onPressed: (_isBusy || _isUploading)
+                        ? null
+                        : () => Navigator.of(context)
+                            .popUntil((route) => route.isFirst),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─── Full-screen camera widget ────
+
+class _FullScreenCamera extends StatelessWidget {
+  const _FullScreenCamera({
+    required this.controller,
+    required this.initializeFuture,
+    required this.error,
+    required this.onRetry,
+  });
+
+  final CameraController? controller;
+  final Future<void>?     initializeFuture;
+  final String?           error;
+  final VoidCallback      onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final size = MediaQuery.sizeOf(context);
+
+    if (error != null) {
+      return Container(
+        color: const Color(0xFF151B25),
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.camera_alt_rounded,
+                    color: Color(0x88FFFFFF), size: 48),
+                const SizedBox(height: 12),
+                Text(
+                  error!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                      color: Color(0xFFBFC6CF), fontSize: 15, height: 1.4),
+                ),
+                const SizedBox(height: 16),
+                TextButton(
+                  onPressed: () async {
+                    final status = await Permission.camera.status;
+                    if (status.isPermanentlyDenied) {
+                      await openAppSettings();
+                      return;
+                    }
+                    onRetry();
+                  },
+                  child: const Text('Enable camera'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    final c    = controller;
+    final init = initializeFuture;
+    if (c == null || init == null) {
+      return Container(color: const Color(0xFF151B25));
+    }
+
+    return FutureBuilder<void>(
+      future: init,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done ||
+            !c.value.isInitialized) {
+          return Container(color: const Color(0xFF151B25));
+        }
+
+   return SizedBox.expand(
+    child: Align(
+      alignment: const Alignment(0, -0.50),
+      child: AspectRatio(
+        aspectRatio: 3.0 / 4.0,
+        child: Transform(
+          alignment: Alignment.center,
+          transform: Matrix4.diagonal3Values(-1, 1, 1),
+          child: CameraPreview(c),
+        ),
+      ),
+    ),
+  );   
+      
+      },
+    );
+  }
+}
+
+class _PlaceholderCircle extends StatelessWidget {
+  const _PlaceholderCircle({required this.diameter});
+  final double diameter;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: diameter,
+      height: diameter,
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Color(0xFF2B3646), Color(0xFF151B25)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+      ),
+      child: const Center(
+        child: SizedBox(
+          width: 34,
+          height: 34,
+          child: CircularProgressIndicator(strokeWidth: 3),
+        ),
+      ),
+    );
+  }
+}
+
+class _CircularCutoutPainter extends CustomPainter {
+  const _CircularCutoutPainter({
+    required this.center,
+    required this.radius,
+  });
+
+  final Offset center;
+  final double radius;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final path = Path()
+      ..addRect(Rect.fromLTWH(0, 0, size.width, size.height))
+      ..addOval(Rect.fromCircle(center: center, radius: radius))
+      ..fillType = PathFillType.evenOdd;
+
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = Colors.black.withOpacity(0.92)
+        ..style = PaintingStyle.fill,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_CircularCutoutPainter old) =>
+      old.center != center || old.radius != radius;
+}
