@@ -1,10 +1,10 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
+import 'package:flutter/services.dart';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+//import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/enrollment_draft.dart';
@@ -32,9 +32,6 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
     with WidgetsBindingObserver {
   static const _analysisThrottle = Duration(milliseconds: 200);
 
-  // Fixed 3:4 aspect ratio
-  static const double _targetPreviewAspect = 3.0 / 4.0;
-
   // Face-detection thresholds (3:4 only)
   static const double _minNormW = 0.15;
   static const double _maxNormW = 0.40;
@@ -47,9 +44,16 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
   static const int _requiredGoodFrames = 3;
   int _consecutiveGoodFrames = 0;
 
+  // Video recording constants
+  static const int _countdownSeconds = 3;
+  static const int _recordDurationSeconds = 5;
+  static const double _bottomPanelHeight = 250;
+
   // Camera / detector state
   CameraController? _controller;
   Future<void>? _initializeFuture;
+
+  /*
 
   final FaceDetector _faceDetector = FaceDetector(
     options: FaceDetectorOptions(
@@ -59,6 +63,8 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
     ),
   );
 
+  */
+
   final BiometricEnrollmentApi _api = BiometricEnrollmentApi();
 
   bool _isAnalyzing = false;
@@ -66,10 +72,14 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
   bool _isBusy = false;
   bool _isUploading = false;
   bool _didTriggerCapture = false;
+  bool _isRecording = false;
   DateTime? _lastAnalysisAt;
   double _lastFrameW = 0;
   double _lastFrameH = 0;
   double _uploadProgress = 0.0;
+  int _countdownValue = _countdownSeconds;
+  Timer? _countdownTimer;
+  Timer? _recordTimer;
   String _status = 'Center your face inside the ring.';
   String? _cameraError;
   String? _uploadErrorDetail;
@@ -77,6 +87,9 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
   @override
   void initState() {
     super.initState();
+    SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+  ]);
     WidgetsBinding.instance.addObserver(this);
     _api.loadEndpoint().then((_) {
       if (mounted) setState(() {});
@@ -87,7 +100,10 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _faceDetector.close();
+    SystemChrome.setPreferredOrientations(
+    DeviceOrientation.values,
+  );
+    //_faceDetector.close();
     _controller?.dispose();
     _controller = null;
     _initializeFuture = null;
@@ -117,8 +133,14 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
   // ─── Camera init ─────
 
   Future<void> _initializeCamera() async {
+    final previousController = _controller;
+    _controller = null;
+    _initializeFuture = null;
+    await previousController?.dispose();
+
     setState(() {
       _cameraError = null;
+      _uploadErrorDetail = null;
       _status = 'Center your face inside the ring.';
     });
 
@@ -133,79 +155,33 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
 
     try {
       final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        setState(() {
+          _cameraError = 'No camera was found on this device.';
+          _status = 'Unable to initialize the camera.';
+        });
+        return;
+      }
+
       final frontCameras = cameras
           .where((c) => c.lensDirection == CameraLensDirection.front)
           .toList();
 
-      CameraDescription front;
+      final front = frontCameras.isNotEmpty ? frontCameras.first : cameras.first;
 
-      if (frontCameras.isEmpty) {
-        front = cameras.first;
-      } else if (frontCameras.length == 1) {
-        front = frontCameras.first;
-      } else {
-        
-        front = frontCameras.first;
-
-        double bestScore = 0;
-
-        for (final cam in frontCameras) {
-          final test = CameraController(cam, ResolutionPreset.medium, enableAudio: false);
-          await test.initialize();
-
-          final size = test.value.previewSize;
-          await test.dispose();
-
-          if (size != null) {
-            final area = size.width * size.height;
-
-            if (area > bestScore) {
-              bestScore = area;
-              front = cam;
-            }
-          }
-        }
-      }
-
-      // Try presets to find one closest to 3:4
-      ResolutionPreset selectedPreset = ResolutionPreset.max;
-      final presetsToTry = [
-        ResolutionPreset.max,
-        ResolutionPreset.ultraHigh,
-        ResolutionPreset.veryHigh,
-        ResolutionPreset.high,
-        ResolutionPreset.medium,
-      ];
-
-      for (final preset in presetsToTry) {
-        final test = CameraController(front, preset, enableAudio: false);
-        await test.initialize();
-        final size = test.value.previewSize;
-        await test.dispose();
-        if (size != null && ((size.width / size.height) - 0.75).abs() < 0.05) {
-          selectedPreset = preset;
-          debugPrint('Found 3:4 preset: $preset (${size.width}x${size.height})');
-          break;
-        }
-      }
-
-      final controller = CameraController(
-        front,
-        selectedPreset,
-        enableAudio: false,
-        imageFormatGroup: Platform.isIOS
-            ? ImageFormatGroup.bgra8888
-            : ImageFormatGroup.yuv420,
-      );
-
+      final controller = await _buildFrontCameraController(front);
       _controller = controller;
-      _initializeFuture = controller.initialize();
+      _initializeFuture = Future<void>.value();
+
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
       setState(() {});
 
-      await _initializeFuture;
-      //await controller.setZoomLevel(0.75);
-      final minZoom = await controller.getMinZoomLevel();
-      await controller.setZoomLevel(minZoom);
+      await _safeLockPortrait(controller);
+      await _safeSetExposureLocked(controller);
+      await _safeSetMinZoom(controller);
 
       if (controller.value.isInitialized) {
         final size = controller.value.previewSize;
@@ -216,10 +192,11 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
 
       if (!mounted) return;
       await _startFaceTracking();
+      await _autoStartRecording();
       setState(() {});
     } on CameraException catch (e) {
       setState(() {
-        _cameraError = e.description ?? e.code;
+        _cameraError = _formatCameraError(e);
         _status = 'Unable to initialize the camera.';
       });
     } catch (e) {
@@ -228,6 +205,80 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
         _status = 'Unable to initialize the camera.';
       });
     }
+  }
+
+  Future<CameraController> _buildFrontCameraController(
+    CameraDescription front,
+  ) async {
+    final presetsToTry = <ResolutionPreset>[
+      ResolutionPreset.medium,
+      ResolutionPreset.high,
+      ResolutionPreset.veryHigh,
+      ResolutionPreset.low,
+    ];
+
+    CameraException? lastCameraException;
+    Object? lastError;
+
+    for (final preset in presetsToTry) {
+      final controller = CameraController(
+        front,
+        preset,
+        enableAudio: false,
+        imageFormatGroup: Platform.isIOS
+            ? ImageFormatGroup.bgra8888
+            : ImageFormatGroup.yuv420,
+      );
+
+      try {
+        await controller.initialize();
+        return controller;
+      } on CameraException catch (e) {
+        lastCameraException = e;
+        await controller.dispose();
+      } catch (e) {
+        lastError = e;
+        await controller.dispose();
+      }
+    }
+
+    if (lastCameraException != null) {
+      throw lastCameraException!;
+    }
+    throw lastError ?? Exception('Unable to initialize the front camera.');
+  }
+
+  Future<void> _safeLockPortrait(CameraController controller) async {
+    try {
+      await controller.lockCaptureOrientation(DeviceOrientation.portraitUp);
+    } catch (e, st) {
+      debugPrint('[Camera] lockCaptureOrientation failed: $e\n$st');
+    }
+  }
+
+  Future<void> _safeSetExposureLocked(CameraController controller) async {
+    try {
+      await controller.setExposureMode(ExposureMode.auto);
+    } catch (e, st) {
+      debugPrint('[Camera] setExposureMode failed: $e\n$st');
+    }
+  }
+
+  Future<void> _safeSetMinZoom(CameraController controller) async {
+    try {
+      final minZoom = await controller.getMinZoomLevel();
+      await controller.setZoomLevel(minZoom);
+    } catch (e, st) {
+      debugPrint('[Camera] setZoomLevel failed: $e\n$st');
+    }
+  }
+
+  String _formatCameraError(CameraException e) {
+    final description = e.description?.trim();
+    if (description != null && description.isNotEmpty) {
+      return description;
+    }
+    return e.code;
   }
 
   // ─── Face tracking ──────
@@ -243,7 +294,7 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
 
     _isStreaming = true;
     _didTriggerCapture = false;
-    _consecutiveGoodFrames = 0;
+    //_consecutiveGoodFrames = 0;
     _setStatus('Center your face inside the ring.');
 
     await controller.startImageStream((image) async {
@@ -256,10 +307,16 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
 
       _isAnalyzing = true;
       try {
-        final inputImage = _buildInputImage(controller, image);
-        if (inputImage == null) return;
-        final faces = await _faceDetector.processImage(inputImage);
+        //final inputImage = _buildInputImage(controller, image);
+        //if (inputImage == null) return;
+
+        /*
+
+        //final faces = await _faceDetector.processImage(inputImage);
         _handleFaces(faces, image.width.toDouble(), image.height.toDouble());
+        
+        */
+
       } catch (e, st) {
         debugPrint('[FaceDetect] $e\n$st');
       } finally {
@@ -267,6 +324,21 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
       }
     });
   }
+
+  // Add this method after _startFaceTracking()
+    Future<void> _autoStartRecording() async {
+      // Wait a moment for camera to stabilize
+      await Future.delayed(const Duration(milliseconds: 1500));
+      
+      if (mounted && !_isBusy && !_isUploading && !_didTriggerCapture) {
+        debugPrint('[Auto] Starting recording sequence');
+        _didTriggerCapture = true;
+        await _startVideoRecordingSequence();
+      }
+    }
+
+
+  /*
 
   InputImage? _buildInputImage(CameraController controller, CameraImage image) {
     final rotation = _inputRotationFromSensor(
@@ -291,6 +363,8 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
         ),
       );
     }
+
+    
 
     if (image.planes.length < 3) {
       debugPrint('[FaceDetect] Expected 3 planes, got ${image.planes.length}');
@@ -357,6 +431,7 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
     }
   }
 
+  
   void _handleFaces(List<Face> faces, double imageWidth, double imageHeight) {
     if (faces.isEmpty) {
       _consecutiveGoodFrames = 0;
@@ -382,6 +457,7 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
       _consecutiveGoodFrames = 0;
     }
   }
+
 
   ({double left, double top, double right, double bottom}) _toDisplayRect(
       Rect box, double imageWidth, double imageHeight) {
@@ -432,44 +508,164 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
            isAreaAppropriate;
   }
 
+  */
+
   void _setStatus(String next) {
     if (!mounted || _status == next) return;
     setState(() => _status = next);
   }
 
-  // ─── Capture & upload (single frame — no video) ───
+  // ─── Video recording sequence (3s invisible countdown + 1s record with green ring) ───
 
-  Future<void> _captureAndUpload() async {
+  Future<void> _startVideoRecordingSequence() async {
+    debugPrint('[Sequence] Entered. isBusy=$_isBusy isUploading=$_isUploading');  // ADD
     final controller = _controller;
     if (controller == null || _isBusy || _isUploading) return;
     if (mounted) setState(() => _uploadErrorDetail = null);
 
     try {
-      // Stop the image stream before taking a picture
+      // Stop the image stream before recording
       if (controller.value.isStreamingImages) {
         await controller.stopImageStream();
+        debugPrint('[Sequence] Image stream stopped');  // ADD
       }
       _isStreaming = false;
       _isBusy = true;
-      _setStatus('Capturing…');
-      if (mounted) setState(() => _uploadProgress = 0.0);
+      debugPrint('[Sequence] Countdown starting...');  // ADD
+      
+      // Reset countdown (invisible to user)
+      _countdownValue = _countdownSeconds;
+      
+      // Start invisible countdown
+      _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+        debugPrint('[Sequence] Countdown tick: $_countdownValue');  // ADD
+        if (!mounted) {
+          timer.cancel();
+          return;
+        }
+        
+        _countdownValue--;
+        
+        if (_countdownValue == 0) {
+          timer.cancel();
+          _startVideoRecording();
+        }
+      });
+    } catch (e) {
+      _didTriggerCapture = false;
+      _isBusy = false;
+      _setStatus('Failed to start. Try again.');
+      await _restartTrackingIfNeeded();
+    }
+  }
 
-      // Take a single still frame
-      final xfile = await controller.takePicture();
+ Future<void> _startVideoRecording() async {
+  debugPrint('[Record] Attempting to start recording...');
+  final controller = _controller;
+  if (controller == null) {
+    debugPrint('[Record] Controller is null, aborting');
+    _didTriggerCapture = false;
+    _isBusy = false;
+    return;
+  }
 
-      _isUploading = true;
-      _setStatus('Uploading…');
-      if (mounted) setState(() => _uploadProgress = 0.5);
+  await controller.lockCaptureOrientation(DeviceOrientation.portraitUp);
 
+  //Log the actual preview size at the moment recording begins
+  debugPrint(
+      'Recording size: ${controller.value.previewSize}'
+  );
+
+  _setStatus('Recording...');
+  if (mounted) {
+    setState(() {
+      _isRecording = true;
+      _uploadProgress = 0.0;
+    });
+  }
+
+  try {
+    await controller.startVideoRecording();
+    debugPrint('[Record] Recording started successfully');
+
+    _recordTimer = Timer(const Duration(seconds: _recordDurationSeconds), () async {
+      debugPrint('[Record] Timer fired, stopping...');
+      if (!mounted) return;
+
+      try {
+        final XFile videoFile = await controller.stopVideoRecording();
+        await controller.pausePreview();
+
+
+        await Future.delayed(
+          const Duration(milliseconds: 100),
+        );
+
+        await controller.resumePreview();
+
+       
+        final file = File(videoFile.path);
+
+        if (!await file.exists()) {
+          debugPrint("Video file missing");
+          return;
+        }
+
+        final size = await file.length();
+        debugPrint("Video size: $size");
+
+        if (size == 0) {
+          debugPrint("Video file is empty");
+          _isBusy = false;
+          _didTriggerCapture = false;
+          _setStatus('Center your face inside the ring.');
+          await _restartTrackingIfNeeded();
+          await _autoStartRecording();
+          return;
+        }
+
+        if (mounted) {
+          setState(() {
+            _isRecording = false;
+            _uploadProgress = 0.5;
+          });
+        }
+        await _uploadVideo(videoFile);
+      } catch (e) {
+        if (mounted) {
+          setState(() => _isRecording = false);
+          _setStatus('Recording failed. Try again.');
+          _didTriggerCapture = false;
+          _isBusy = false;
+          await _restartTrackingIfNeeded();
+        }
+      }
+    });
+  } catch (e) {
+    setState(() => _isRecording = false);
+    _setStatus('Recording failed. Try again.');
+    _didTriggerCapture = false;
+    _isBusy = false;
+    await _restartTrackingIfNeeded();
+  }
+}
+
+
+  Future<void> _uploadVideo(XFile videoFile) async {
+    _isUploading = true;
+    _setStatus('Processing video...');
+    if (mounted) setState(() => _uploadProgress = 0.6);
+
+    try {
       final result = await _api.uploadEnrollment(
         draft: widget.draft,
-        videoFile: File(xfile.path),   // API accepts a File; pass the JPEG
+        videoFile: File(videoFile.path),
         frameWidth: _lastFrameW,
         frameHeight: _lastFrameH,
       );
 
-      // Clean up the temp image
-      try { await File(xfile.path).delete(); } catch (_) {}
+      // Clean up the temp video
+      try { await File(videoFile.path).delete(); } catch (_) {}
 
       if (!mounted) return;
 
@@ -532,27 +728,38 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.sizeOf(context);
+    final previewHeight = size.height - _bottomPanelHeight;
 
     //Circle size
     final double ringSize = (size.width * 0.75).clamp(240.0, 340.0);
-    final double ringCentreFromTop = size.height * 0.38;
+    final double ringCentreFromTop = previewHeight * 0.50;
     final double ringLeft         = (size.width - ringSize) / 2;
     final double ringTop          = ringCentreFromTop - ringSize / 2;
     const double tickRingMargin   = 20;
 
     return Scaffold(
       backgroundColor: Colors.transparent,
+      bottomSheet: null,
       extendBodyBehindAppBar: true,
       extendBody: true,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // 1. Full-screen camera feed
-          _FullScreenCamera(
-            controller: _controller,
-            initializeFuture: _initializeFuture,
-            error: _cameraError,
-            onRetry: _initializeCamera,
+          // 1. Transparent full-screen background
+          const SizedBox.expand(),
+
+          Positioned(
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: _bottomPanelHeight,
+            child: _FullScreenCamera(
+              controller: _controller,
+              initializeFuture: _initializeFuture,
+              error: _cameraError,
+              isRecording: _isRecording,
+              onRetry: _initializeCamera,
+            ),
           ),
 
           // 2. Close button
@@ -577,7 +784,9 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
             ),
           ),
 
-          // 3. Tick-ring overlay
+          // 3. Main Tick Ring - shows recording progress with green ticks
+          //    - Shows normal ring during face detection
+          //    - Turns green progressively during recording and upload
           Positioned(
             left:   ringLeft - tickRingMargin,
             top:    ringTop  - tickRingMargin,
@@ -591,16 +800,19 @@ class _LookAtCameraScreenState extends State<LookAtCameraScreen>
               gap:               0,
               tickColor:         const Color(0xFFBFC6CF),
               activeTickColor:   const Color(0xFF00E676),
-              activeTickFraction: _uploadProgress,
+              // During recording: show full green ring
+              // During upload: show progress
+              // Otherwise: no active ticks
+              activeTickFraction: _isRecording ? 1.0 : _uploadProgress,
               child: const SizedBox.shrink(),
             ),
           ),
-
           // 4. Bottom panel
           Align(
             alignment: Alignment.bottomCenter,
             child: Container(
               width: double.infinity,
+              height: _bottomPanelHeight,
               color: Colors.black,
               padding: const EdgeInsets.fromLTRB(24, 28, 24, 32),
               child: Column(
@@ -676,21 +888,23 @@ class _FullScreenCamera extends StatelessWidget {
     required this.controller,
     required this.initializeFuture,
     required this.error,
+    required this.isRecording,
     required this.onRetry,
   });
 
   final CameraController? controller;
   final Future<void>?     initializeFuture;
   final String?           error;
+  final bool              isRecording;
   final VoidCallback      onRetry;
+
+  static const double _targetPreviewAspect = 3.0 / 4.0;
 
   @override
   Widget build(BuildContext context) {
-    final size = MediaQuery.sizeOf(context);
-
     if (error != null) {
       return Container(
-        color: const Color(0xFF151B25),
+        color: const Color(0xFF1D2430),
         child: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
@@ -728,7 +942,7 @@ class _FullScreenCamera extends StatelessWidget {
     final c    = controller;
     final init = initializeFuture;
     if (c == null || init == null) {
-      return Container(color: const Color(0xFF151B25));
+      return const SizedBox.expand();
     }
 
     return FutureBuilder<void>(
@@ -736,23 +950,34 @@ class _FullScreenCamera extends StatelessWidget {
       builder: (context, snapshot) {
         if (snapshot.connectionState != ConnectionState.done ||
             !c.value.isInitialized) {
-          return Container(color: const Color(0xFF151B25));
+          return const Center(
+            child: SizedBox(
+              width: 34,
+              height: 34,
+              child: CircularProgressIndicator(strokeWidth: 3),
+            ),
+          );
         }
 
-   return SizedBox.expand(
-    child: Align(
-      alignment: const Alignment(0, -0.50),
-      child: AspectRatio(
-        aspectRatio: 3.0 / 4.0,
-        child: Transform(
-          alignment: Alignment.center,
-          transform: Matrix4.diagonal3Values(-1, 1, 1),
-          child: CameraPreview(c),
-        ),
-      ),
-    ),
-  );   
-      
+        final previewSize = c.value.previewSize;
+        final previewAspect = previewSize == null
+            ? _targetPreviewAspect
+            : previewSize.height / previewSize.width;
+
+        return SizedBox.expand(
+          child: Transform(
+            alignment: Alignment.center,
+            transform: Matrix4.diagonal3Values(-1, 1, 1),
+            child: FittedBox(
+              fit: BoxFit.contain,
+              child: SizedBox(
+                width: 1000,
+                height: 1000 / previewAspect,
+                child: CameraPreview(c),
+              ),
+            ),
+          ),
+        );
       },
     );
   }
